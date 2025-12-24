@@ -1,0 +1,96 @@
+name: Windows NoVNC
+on:
+  workflow_dispatch:
+concurrency:
+  group: vps
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 55
+    steps:
+    - uses: actions/checkout@v4
+    - name: Setup
+      run: choco install googlechrome 7zip -y --no-progress --ignore-checksums
+    - name: Password
+      shell: pwsh
+      run: |
+        $pw = ConvertTo-SecureString "Vps@HGYU99Lg8" -AsPlainText -Force
+        Set-LocalUser -Name "runneradmin" -Password $pw
+    - name: VNC
+      shell: cmd
+      run: |
+        echo Downloading TightVNC...
+        curl -L -o vnc.msi https://www.tightvnc.com/download/2.8.63/tightvnc-2.8.63-gpl-setup-64bit.msi
+        
+        echo Installing TightVNC...
+        msiexec /i vnc.msi /quiet /norestart ADDLOCAL=Server SERVER_REGISTER_AS_SERVICE=1 SERVER_ADD_FIREWALL_EXCEPTION=1 SET_USEVNCAUTHENTICATION=1 VALUE_OF_USEVNCAUTHENTICATION=1 SET_PASSWORD=1 VALUE_OF_PASSWORD=Vps@HGYU99Lg8 SET_ALLOWLOOPBACK=1 VALUE_OF_ALLOWLOOPBACK=1
+        timeout /t 10 /nobreak
+        
+        echo Configuring registry...
+        reg add "HKLMSOFTWARETightVNCServer" /v AllowLoopback /t REG_DWORD /d 1 /f
+        reg add "HKLMSOFTWARETightVNCServer" /v LoopbackOnly /t REG_DWORD /d 0 /f
+        reg add "HKLMSOFTWARETightVNCServer" /v AcceptRfbConnections /t REG_DWORD /d 1 /f
+        
+        echo Restarting VNC service...
+        net stop tvnserver
+        timeout /t 3 /nobreak
+        net start tvnserver
+        timeout /t 5 /nobreak
+    - name: Websockify
+      shell: pwsh
+      run: |
+        Write-Host "Installing websockify..."
+        pip install websockify -q
+        
+        Write-Host "Downloading noVNC..."
+        Invoke-WebRequest -Uri "https://github.com/novnc/noVNC/archive/refs/tags/v1.5.0.zip" -OutFile "novnc.zip" -UseBasicParsing
+        Expand-Archive novnc.zip -DestinationPath . -Force
+        if (Test-Path "noVNC-1.5.0") { Rename-Item "noVNC-1.5.0" "noVNC" -Force }
+        
+        Write-Host "Starting websockify..."
+        Start-Process python -ArgumentList "-m","websockify","--web","noVNC","6080","127.0.0.1:5900" -WindowStyle Hidden
+        Start-Sleep -Seconds 5
+        Write-Host "Websockify started"
+    - name: Tunnel
+      shell: pwsh
+      run: |
+        Write-Host "Downloading cloudflared..."
+        Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "cf.exe" -UseBasicParsing
+        
+        Write-Host "Starting tunnel..."
+        Start-Process .cf.exe -ArgumentList "tunnel","--url","http://localhost:6080","--logfile","cf.log" -WindowStyle Hidden
+        Start-Sleep -Seconds 45
+        
+        Write-Host "Looking for tunnel URL..."
+        $url = ""
+        for ($i = 0; $i -lt 30; $i++) {
+          if (Test-Path cf.log) {
+            $content = Get-Content cf.log -Raw -ErrorAction SilentlyContinue
+            $match = [regex]::Match($content, 'https://[a-zA-Z0-9-]+.trycloudflare.com')
+            if ($match.Success) {
+              $url = $match.Value
+              Write-Host "Found URL: $url"
+              break
+            }
+          }
+          Start-Sleep 2
+        }
+        
+        if ($url) {
+          "$url/vnc.html|Vps@HGYU99Lg8" | Out-File info.txt -NoNewline -Encoding UTF8
+          Write-Host "Saved connection info"
+        } else {
+          "ERROR|Tunnel not found" | Out-File info.txt -NoNewline -Encoding UTF8
+          Write-Host "ERROR: Could not find tunnel URL"
+          if (Test-Path cf.log) { Get-Content cf.log -Tail 20 }
+        }
+    - uses: actions/upload-artifact@v4
+      with:
+        name: result
+        path: info.txt
+    - name: Keep
+      shell: pwsh
+      run: |
+        Write-Host "VPS running for 30 minutes..."
+        Start-Sleep -Seconds (30 * 60)
